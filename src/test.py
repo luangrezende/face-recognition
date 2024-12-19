@@ -10,6 +10,7 @@ import faiss
 from queue import Queue
 import signal
 import sys
+import time
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 
@@ -17,14 +18,14 @@ KNOWN_FACES_DIR = "faces"
 ENCODINGS_FILE = "encodings.pkl"
 NAMES_MAP_FILE = "names_map.json"
 TOLERANCE = 0.6
-FRAME_SKIP = 3
+FRAME_SKIP = 4
 DISPLAY_TIME = 30
 
 known_face_encodings = []
 known_face_names = []
 
 cv2.setUseOptimized(True)
-cv2.setNumThreads(4)
+cv2.setNumThreads(cv2.getNumberOfCPUs())
 
 if os.path.exists(NAMES_MAP_FILE):
     with open(NAMES_MAP_FILE, "r") as f:
@@ -34,7 +35,6 @@ else:
         f"{NAMES_MAP_FILE} não encontrado. Usando nomes baseados nos arquivos."
     )
     names_map = {}
-
 
 def load_or_generate_encodings():
     if os.path.exists(ENCODINGS_FILE):
@@ -62,10 +62,14 @@ def load_or_generate_encodings():
             pickle.dump((encodings, names), f)
         return encodings, names
 
-
 class VideoStream:
     def __init__(self):
         self.video_capture = cv2.VideoCapture(0)
+        self.video_capture.set(cv2.CAP_PROP_FPS, 60)
+        self.video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.video_capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+
         self.ret = False
         self.frame = None
         self.running = True
@@ -84,28 +88,35 @@ class VideoStream:
         self.thread.join()
         self.video_capture.release()
 
-
 known_face_encodings, known_face_names = load_or_generate_encodings()
 
 logging.info("Inicializando o índice FAISS.")
-index = faiss.IndexFlatL2(128)
+try:
+    res = faiss.StandardGpuResources()
+    index = faiss.IndexFlatL2(128)
+    index = faiss.index_cpu_to_gpu(res, 0, index)
+    logging.info("FAISS configurado para usar GPU.")
+except Exception as e:
+    logging.warning(f"Fallo ao configurar GPU. Rodando em CPU: {e}")
+    index = faiss.IndexFlatL2(128)
+
 if known_face_encodings:
     index.add(np.array(known_face_encodings, dtype=np.float32))
 
 video_stream = VideoStream()
 
 face_display_data = {}
-frame_count = 0
-frame_queue = Queue(maxsize=10)
-processed_queue = Queue(maxsize=10)
-
+frame_queue = Queue(maxsize=100)
+processed_queue = Queue(maxsize=100)
+frame_counter = 0
 
 def capture_frames(video_stream, frame_queue):
+    global frame_counter
     while video_stream.running:
         ret, frame = video_stream.read()
-        if ret and not frame_queue.full():
+        frame_counter += 1
+        if ret and not frame_queue.full() and frame_counter % FRAME_SKIP == 0:
             frame_queue.put(frame)
-
 
 def process_frames(frame_queue, processed_queue):
     global face_display_data
@@ -113,19 +124,11 @@ def process_frames(frame_queue, processed_queue):
         if not frame_queue.empty():
             frame = frame_queue.get()
 
-            # Alteração no fator de escala
-            small_frame = cv2.resize(
-                frame, (0, 0), fx=0.5, fy=0.5
-            )  # Escala ajustada para mais detalhes
+            small_frame = cv2.resize(frame, (0, 0), fx=0.5, fy=0.5)
             rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-            # Alteração no modelo para 'cnn'
-            face_locations = face_recognition.face_locations(
-                rgb_small_frame, model="cnn"
-            )
-            face_encodings = face_recognition.face_encodings(
-                rgb_small_frame, face_locations
-            )
+            face_locations = face_recognition.face_locations(rgb_small_frame, model="cnn")
+            face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
 
             for face_encoding, face_location in zip(face_encodings, face_locations):
                 distances, indices = index.search(
@@ -134,13 +137,13 @@ def process_frames(frame_queue, processed_queue):
                 name = "Desconhecido"
                 confidence = 0.0
 
-                if distances[0][0] < TOLERANCE:  # TOLERANCE ajustado
+                if distances[0][0] < TOLERANCE:
                     best_match_index = indices[0][0]
                     name = known_face_names[best_match_index]
                     confidence = 1 - distances[0][0]
 
                 top, right, bottom, left = face_location
-                top *= 2  # Fator de escala ajustado para 0.5 (reversão)
+                top *= 2
                 right *= 2
                 bottom *= 2
                 left *= 2
@@ -152,7 +155,6 @@ def process_frames(frame_queue, processed_queue):
                 }
 
             processed_queue.put(frame)
-
 
 def display_frames(processed_queue):
     global face_display_data
@@ -180,10 +182,9 @@ def display_frames(processed_queue):
                     del face_display_data[name]
 
             cv2.imshow("Video", frame)
-            if cv2.waitKey(5) & 0xFF == ord("q"):
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 stop_program()
                 break
-
 
 def stop_program():
     logging.info("Encerrando o programa...")
@@ -191,19 +192,13 @@ def stop_program():
     cv2.destroyAllWindows()
     sys.exit(0)
 
-
 def signal_handler(sig, frame):
     stop_program()
 
-
 signal.signal(signal.SIGINT, signal_handler)
 
-capture_thread = threading.Thread(
-    target=capture_frames, args=(video_stream, frame_queue)
-)
-process_thread = threading.Thread(
-    target=process_frames, args=(frame_queue, processed_queue)
-)
+capture_thread = threading.Thread(target=capture_frames, args=(video_stream, frame_queue))
+process_thread = threading.Thread(target=process_frames, args=(frame_queue, processed_queue))
 display_thread = threading.Thread(target=display_frames, args=(processed_queue,))
 
 capture_thread.start()

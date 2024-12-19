@@ -99,7 +99,3 @@ pip-delete-this-directory.txt
 *.bak
 *.orig
 *.tmp
-
-# Ignore photos in the faces directory
-faces/*
-!faces/.gitkeep
